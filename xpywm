@@ -44,6 +44,7 @@ MAX_VSCREEN = 3
 
 EVENT_HANDLER = {
     X.KeyPress: 'handle_keypress',
+    X.KeyRelease: 'handle_keyrelease',
     X.ButtonPress: 'handle_button_press',
     X.MotionNotify: 'handle_motion_notify',
     X.ButtonRelease: 'handle_button_release',
@@ -276,6 +277,19 @@ class WindowManager():
         self.drag_start_xy = None
         self.drag_last_time = 0
 
+        self.is_selection_mode = False
+        self.mod_string = ['shift', 'lock', 'control', 'mod1', 'mod2', 'mod3', 'mod4', 'mod5']
+        self.mod_mask_string = {X.ShiftMask: 'shift',
+                                X.LockMask: 'lock',
+                                X.ControlMask: 'control',
+                                X.Mod1Mask: 'mod1',
+                                X.Mod2Mask: 'mod2',
+                                X.Mod3Mask: 'mod3',
+                                X.Mod4Mask: 'mod4',
+                                X.Mod5Mask: 'mod5'}
+        self.modmap = {}
+        self.parse_xmodmap()
+
     def catch_events(self):
         """Configure the root window to receive all events needed for managing
         windows."""
@@ -309,6 +323,19 @@ class WindowManager():
                                          X.ButtonPressMask, X.GrabModeAsync,
                                          X.GrabModeAsync, X.NONE, X.NONE)
             debug('grab_button: %d', button)
+
+    def parse_xmodmap(self):
+        out = subprocess.getoutput('xmodmap')
+        for modifier in self.mod_string:
+            self.modmap[modifier] = []
+            match = re.search(r'{} +(.+\(0x[0-9a-f]+\)(,  )?)+'.format(modifier), out)
+            if match == None:
+                continue
+            keys = re.findall(r'([^?!,.]+ \(0x[0-9a-f]+\))', match.group(1))
+            for k in keys:
+                m = re.search(r'0x([0-9a-f]+)', k)
+                value = int(m.group(0), 16)
+                self.modmap[modifier].append(value)
 
     # ---------------- X wrapper functions
     def is_alive_window(self, window):
@@ -570,6 +597,17 @@ class WindowManager():
         else:
             self.raise_window(window)
 
+    def sort_exposed_windows(self):
+        def _sort_key(window):
+            geom = self.get_window_geometry(window)
+            if geom is None:
+                return 100000000
+            else:
+                return geom.x * 10000 + geom.y
+
+        # sort active windows with their geometries
+        self.exposed_windows = sorted(self.exposed_windows, key=_sort_key)
+
     def focus_window(self, window):
         """Activate the input to the window WINDOW and the window frame is
         displayed."""
@@ -589,15 +627,7 @@ class WindowManager():
         """Change the active window from the window WINDOW to the next one.
         The active window is raised and focused.  The pointer is moved to the
         north-west of the window."""
-        def _sort_key(window):
-            geom = self.get_window_geometry(window)
-            if geom is None:
-                return 100000000
-            else:
-                return geom.x * 10000 + geom.y
-
-        # sort active windows with their geometries
-        windows = sorted(self.exposed_windows, key=_sort_key)
+        windows = self.exposed_windows
         try:
             i = windows.index(window)
             next_window = windows[(i + 1) % len(windows)]
@@ -609,6 +639,14 @@ class WindowManager():
         next_window.raise_window()
         next_window.warp_pointer(PNT_OFFSET, PNT_OFFSET)
         self.focus_window(next_window)
+
+
+    def set_window_to_stack_top(self, window):
+        if window not in self.exposed_windows:
+            return
+        idx = self.exposed_windows.index(window)
+        self.exposed_windows.pop(idx)
+        self.exposed_windows.insert(0, window)
 
     def is_maximized(self, window):
         """Check if the window WINDOW seems to have been maximized."""
@@ -788,7 +826,21 @@ class WindowManager():
 
     def cb_focus_next_window(self, event):
         window = event.child
-        self.focus_next_window(window)
+        if self.is_selection_mode:
+            self.focus_next_window(window)
+        else:
+            self.is_selection_mode = True
+            self.screen.root.grab_keyboard(True, X.GrabModeAsync, X.GrabModeAsync, X.CurrentTime)
+            self.set_window_to_stack_top(window)
+            try:
+                self.focus_next_window(self.exposed_windows[0])
+            except:
+                pass
+            modifier = event.state
+            self.pressed_keys = set()
+            for i in range(len(self.mod_string)+1):
+                if 1<<i & modifier is not 0:
+                    self.pressed_keys = self.pressed_keys | {self.mod_mask_string[1<<i]}
 
     def cb_maximize_window(self, event, horizontally=True):
         window = event.child
@@ -862,6 +914,19 @@ class WindowManager():
         elif 'command' in entry:
             os.system(entry['command'])
 
+    def handle_keyrelease(self, event):
+        keycode = event.detail
+        modgroup = None
+        for mod, keys in self.modmap.items():
+            if keycode in keys:
+                modgroup = mod
+                break
+        if modgroup == None:
+            return
+        if modgroup in self.pressed_keys:
+            self.display.ungrab_keyboard(X.CurrentTime)
+            self.is_selection_mode = False
+
     def handle_button_press(self, event):
         """Initiate window repositioning with the button 1 or window resizing
         with the button 3.  All mouse pointer motion events are captured until
@@ -903,6 +968,8 @@ class WindowManager():
         """Reposition or resize the current window according to the current
         pointer position.  The maximum rate of repositioning and resizeing is
         bounded by DRAG_MAX_FPS."""
+        if self.drag_window == X.NONE:
+            return
         x, y = event.root_x, event.root_y
         # prevent to reposition window too frequently
         if time.time() - self.drag_last_time <= 1 / DRAG_MAX_FPS:
